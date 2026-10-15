@@ -1,0 +1,130 @@
+name: Moteur Snapdragon (NPU Hexagon + GPU Adreno)
+
+# llama.cpp, compilé pour Windows sur Snapdragon avec les backends Hexagon
+# (NPU) et OpenCL (Adreno), absents des releases officielles. Les
+# bibliothèques NPU (libggml-htp-v*.so) sont signées dans un catalogue par le
+# certificat de Locaryn (secret HTP_CERT_PFX_B64) : sur le PC, activer-npu.ps1
+# fait confiance à ce certificat.
+
+on:
+  push:
+    tags: ["b*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LLAMA_TAG: b11003
+  HEXAGON_SDK: 6.6.0.0
+  OPENCL_SDK: 2.3.2
+
+jobs:
+  windows-snapdragon:
+    runs-on: windows-11-arm
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Sources de llama.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_TAG }}
+          path: llama.cpp
+
+      - name: Outils (Ninja, LLVM)
+        run: |
+          choco install -y ninja
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) { choco install -y llvm }
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (Test-Path $llvm) { Add-Content $env:GITHUB_PATH $llvm }
+
+      - name: SDK Hexagon et OpenCL (versions allégées pour la CI)
+        run: |
+          New-Item -ItemType Directory -Force C:\Qualcomm\Hexagon_SDK, C:\Qualcomm\OpenCL_SDK | Out-Null
+          curl.exe -fsSL -o hex.tar.xz "https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v$env:HEXAGON_SDK/hexagon-sdk-v$env:HEXAGON_SDK-arm64-wos.tar.xz"
+          curl.exe -fsSL -o ocl.tar.xz "https://github.com/snapdragon-toolchain/opencl-sdk/releases/download/v$env:OPENCL_SDK/adreno-opencl-sdk-v$env:OPENCL_SDK-arm64-wos.tar.xz"
+          New-Item -ItemType Directory -Force "C:\Qualcomm\Hexagon_SDK\$env:HEXAGON_SDK", "C:\Qualcomm\OpenCL_SDK\$env:OPENCL_SDK" | Out-Null
+          tar -xf hex.tar.xz -C "C:\Qualcomm\Hexagon_SDK\$env:HEXAGON_SDK" --strip-components=1
+          tar -xf ocl.tar.xz -C "C:\Qualcomm\OpenCL_SDK\$env:OPENCL_SDK" --strip-components=1
+          Remove-Item hex.tar.xz, ocl.tar.xz
+          $tools = Get-ChildItem "C:\Qualcomm\Hexagon_SDK\$env:HEXAGON_SDK\tools\HEXAGON_Tools" -Directory | Sort-Object Name | Select-Object -Last 1
+          "HEXAGON_SDK_ROOT=C:\Qualcomm\Hexagon_SDK\$env:HEXAGON_SDK" | Add-Content $env:GITHUB_ENV
+          "HEXAGON_TOOLS_ROOT=$($tools.FullName)" | Add-Content $env:GITHUB_ENV
+          "OPENCL_SDK_ROOT=C:\Qualcomm\OpenCL_SDK\$env:OPENCL_SDK" | Add-Content $env:GITHUB_ENV
+          Get-ChildItem C:\Qualcomm -Depth 2 | Select-Object FullName
+
+      - name: Certificat de signature et outils du Windows SDK
+        env:
+          PFX_B64: ${{ secrets.HTP_CERT_PFX_B64 }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "locaryn-htp.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+          "HEXAGON_HTP_CERT=$pfx" | Add-Content $env:GITHUB_ENV
+          # inf2cat et signtool : le CMake du backend les cherche sous WINDOWS_SDK_BIN.
+          $sign = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $inf = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter inf2cat.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $inf) {
+            choco install -y windowsdriverkit11 --ignore-checksums
+            $inf = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter inf2cat.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          Write-Host "signtool : $($sign.FullName)"; Write-Host "inf2cat : $($inf.FullName)"
+          $bin = $sign.Directory.Parent.FullName
+          "WINDOWS_SDK_BIN=$bin" | Add-Content $env:GITHUB_ENV
+          # Le CMake ne cherche inf2cat que dans <bin>\arm64 et <bin>\x86 : on
+          # le rend visible là s'il est installé ailleurs.
+          if ($inf -and -not (Test-Path (Join-Path $bin "x86\inf2cat.exe"))) {
+            Copy-Item $inf.Directory.FullName\* (Join-Path $bin "x86") -Recurse -Force
+          }
+
+      - name: Configurer
+        working-directory: llama.cpp
+        run: |
+          Copy-Item docs\backend\snapdragon\CMakeUserPresets.json .
+          cmake --preset arm64-windows-snapdragon-release -B build-wos -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+
+      - name: Compiler
+        working-directory: llama.cpp
+        run: |
+          cmake --build build-wos --config Release -j 8
+          cmake --install build-wos --prefix ..\pkg
+
+      - name: Vérifier la signature du catalogue NPU
+        run: |
+          Get-ChildItem pkg -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+          $cat = Get-ChildItem pkg -Recurse -Filter libggml-htp.cat | Select-Object -First 1
+          if (-not $cat) { throw "libggml-htp.cat absent : les bibliothèques NPU ne sont pas signées." }
+
+      - name: Paquet
+        run: |
+          $nom = "llama-$env:LLAMA_TAG-bin-win-snapdragon-arm64"
+          New-Item -ItemType Directory -Force $nom | Out-Null
+          Copy-Item pkg\bin\* $nom -Recurse -Force
+          if (Test-Path pkg\lib) { Copy-Item pkg\lib\*.dll, pkg\lib\*.so, pkg\lib\*.cat $nom -Force -ErrorAction SilentlyContinue }
+          Copy-Item scripts\* $nom -Force
+          Compress-Archive -Path "$nom\*" -DestinationPath "$nom.zip"
+          (Get-FileHash "$nom.zip" -Algorithm SHA256).Hash.ToLower() + "  $nom.zip" | Out-File SHA256SUMS.txt -Encoding ascii
+          Get-ChildItem $nom | Select-Object Name, Length | Format-Table -AutoSize
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: llama-win-snapdragon-arm64
+          path: |
+            llama-*-bin-win-snapdragon-arm64.zip
+            SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          prerelease: true
+          name: "llama.cpp ${{ github.ref_name }} — Snapdragon (NPU Hexagon + Adreno)"
+          files: |
+            llama-*-bin-win-snapdragon-arm64.zip
+            SHA256SUMS.txt
+          body: |
+            llama.cpp ${{ env.LLAMA_TAG }} pour Windows sur Snapdragon, avec le NPU Hexagon et le GPU Adreno.
+            Utilisé par Locaryn quand le mode NPU est activé. Pour autoriser le NPU, lancez une fois `activer-npu.ps1` en administrateur (voir le README), puis redémarrez.
