@@ -73,13 +73,15 @@ jobs:
             $inf = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter inf2cat.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           }
           Write-Host "signtool : $($sign.FullName)"; Write-Host "inf2cat : $($inf.FullName)"
-          $bin = $sign.Directory.Parent.FullName
-          "WINDOWS_SDK_BIN=$bin" | Add-Content $env:GITHUB_ENV
-          # Le CMake ne cherche inf2cat que dans <bin>\arm64 et <bin>\x86 : on
-          # le rend visible là s'il est installé ailleurs.
-          if ($inf -and -not (Test-Path (Join-Path $bin "x86\inf2cat.exe"))) {
-            Copy-Item $inf.Directory.FullName\* (Join-Path $bin "x86") -Recurse -Force
+          # Le CMake les cherche dans <bin>rm64 et <bin> d'un même dossier :
+          # celui du SDK qui a inf2cat, avec signtool à côté s'il n'y est pas.
+          $bin = $inf.Directory.Parent.FullName
+          foreach ($sous in "arm64", "x86") {
+            $d = Join-Path $bin $sous
+            New-Item -ItemType Directory -Force $d | Out-Null
+            if (-not (Test-Path (Join-Path $d "signtool.exe"))) { Copy-Item -Path (Join-Path $sign.Directory.FullName "*") -Destination $d -Recurse -Force -ErrorAction SilentlyContinue }
           }
+          "WINDOWS_SDK_BIN=$bin" | Add-Content $env:GITHUB_ENV
 
       - name: Configurer
         working-directory: llama.cpp
